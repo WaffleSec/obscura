@@ -216,4 +216,202 @@ impl Element<'_> {
             Err(Error::ElementNotFound("click failed".into()))
         }
     }
+
+    /// Insert text into element in one-shot
+    pub fn fill(&self, text: &str) -> Result<(), Error> {
+        let focused = self.page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); if (el) {{ el.focus(); return true; }} return false; }})()",
+            self.node_id
+        ));
+        if !focused.as_bool().unwrap_or(false) {
+            return Err(Error::ElementNotFound("fill failed: element not found".into()));
+        }
+
+        let input_text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
+        let result = self.page.evaluate(&format!(
+            "(function() {{\
+                var t = document.activeElement;\
+                if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return false;\
+                var val = {};\
+                globalThis.__obscura_setFieldValue(t, 'value', val);\
+                try {{ t.setSelectionRange(val.length, val.length); }} catch (_e) {{}}\
+                t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+                return true;\
+                }})()",
+            input_text
+        ));
+
+        if result.as_bool().unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(Error::ElementNotFound("fill failed".into()))
+        }
+    }
+
+    /// Type text into the element to look more human-like
+    pub async fn type_text(&self, text: &str) -> Result<(), Error> {
+        // Evaluate if this is an element we can input into
+        let is_typeable = self.page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); return !!el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable); }})()",
+            self.node_id
+        ));
+        if !is_typeable.as_bool().unwrap_or(false) {
+            return Err(Error::ElementNotFound("not a typeable element".into()));
+        }
+        // Scroll into view
+        self.page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); if (el) el.scrollIntoView({{block:'center'}}); }})()",
+            self.node_id
+        ));
+        // Focus input for typing
+        let focused = self.page.evaluate(&format!(
+            "(function() {{ var el = globalThis._wrap && globalThis._wrap({}); if (el) {{ el.focus(); return true; }} return false; }})()",
+            self.node_id
+        ));
+        if !focused.as_bool().unwrap_or(false) {
+            return Err(Error::ElementNotFound("element could not be focused".into()));
+        }
+        // Handle whether we need to send a KeyUp or KeyDown for the shift key
+        let mut is_shifted = false;
+        // Typing loop
+        for char in text.chars() {
+            //Resolve keycode from char
+            let (key, code, shift): (String, &'static str, bool) = match char {
+                '\n' | '\r' => ("Enter".to_string(), "Enter", false),
+                '\t' => ("Tab".to_string(), "Tab", false),
+                other => {
+                    let mut buf = [0u8; 4];
+                    let (code, shift) = keycode_with_shift(other);
+                    (other.encode_utf8(&mut buf).to_string(), code, shift)
+                }
+            };
+            let key_json = serde_json::to_string(&key)
+                .unwrap_or_else(|_| "\"\"".to_string());
+            let code_json = serde_json::to_string(&code)
+                .unwrap_or_else(|_| "\"\"".to_string());
+
+            //Check if we need to specify whether shift should be held up or down
+            match (is_shifted, shift) {
+                (false, true) => {
+                    self.page.evaluate("function () {{ var t = document.activeElement; if (t) t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:Shift,code:ShiftLeft,shiftKey:true,location:1}}))); }})()");
+                    is_shifted = true;
+                },
+                (true, false) => {
+                    self.page.evaluate("function () {{ var t = document.activeElement; if (t) t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,cancelable:true,key:Shift,code:ShiftLeft,shiftKey:false,location:1}}))); }})()");
+                    is_shifted = false;
+                },
+                _ => (),
+            }
+
+            //Keydown event
+            self.page.evaluate(&format!(
+                "(function() {{ var t = document.activeElement; if (t) t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keydown', {{bubbles:true,cancelable:true,key:{},code:{},shiftKey:{}}}))); }})()",
+                key_json,
+                code_json,
+                shift
+            ));
+
+            //Fill the keycode
+            self.page.evaluate(&format!(
+                "(function() {{\
+                    var t = document.activeElement;\
+                    if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+                    var ins = {};\
+                    var v = t.value || '';\
+                    var s = t.selectionStart, e = t.selectionEnd;\
+                    if (s == null) {{ globalThis.__obscura_setFieldValue(t, 'value', v + ins); }}\
+                    else {{\
+                        s = Math.max(0, Math.min(s, v.length));\
+                        e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
+                        var lo = Math.min(s, e), hi = Math.max(s, e);\
+                        globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + ins + v.slice(hi));\
+                        var caret = lo + ins.length;\
+                        t.setSelectionRange(caret, caret);\
+                    }}\
+                    t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
+                }})()",
+                key_json
+            ));
+
+            //Keyup event
+            self.page.evaluate(&format!(
+                "(function() {{ var t = document.activeElement; if (t) t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,cancelable:true,key:{},code:{},shiftKey:{}}}))); }})()",
+                key_json,
+                code_json,
+                shift
+            ));
+
+            // Add some jitter without system or crate randomization
+            let jitter = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0);
+            let delay = Duration::from_millis(40 + (jitter % 100) as u64);
+
+            tokio::time::sleep(delay).await;
+        }
+
+        //Cleanup shift key if it's still being held
+        if is_shifted {
+            self.page.evaluate("function () {{ var t = document.activeElement; if (t) t.dispatchEvent(globalThis.__obscura_markTrusted(new KeyboardEvent('keyup', {{bubbles:true,cancelable:true,key:Shift,code:ShiftLeft,shiftKey:false,location:1}}))); }})()");
+        }
+
+        Ok(())
+    }
+}
+
+fn keycode_with_shift(c: char) -> (&'static str, bool) {
+    match c {
+        'a' => ("KeyA", false), 'A' => ("KeyA", true),
+        'b' => ("KeyB", false), 'B' => ("KeyB", true),
+        'c' => ("KeyC", false), 'C' => ("KeyC", true),
+        'd' => ("KeyD", false), 'D' => ("KeyD", true),
+        'e' => ("KeyE", false), 'E' => ("KeyE", true),
+        'f' => ("KeyF", false), 'F' => ("KeyF", true),
+        'g' => ("KeyG", false), 'G' => ("KeyG", true),
+        'h' => ("KeyH", false), 'H' => ("KeyH", true),
+        'i' => ("KeyI", false), 'I' => ("KeyI", true),
+        'j' => ("KeyJ", false), 'J' => ("KeyJ", true),
+        'k' => ("KeyK", false), 'K' => ("KeyK", true),
+        'l' => ("KeyL", false), 'L' => ("KeyL", true),
+        'm' => ("KeyM", false), 'M' => ("KeyM", true),
+        'n' => ("KeyN", false), 'N' => ("KeyN", true),
+        'o' => ("KeyO", false), 'O' => ("KeyO", true),
+        'p' => ("KeyP", false), 'P' => ("KeyP", true),
+        'q' => ("KeyQ", false), 'Q' => ("KeyQ", true),
+        'r' => ("KeyR", false), 'R' => ("KeyR", true),
+        's' => ("KeyS", false), 'S' => ("KeyS", true),
+        't' => ("KeyT", false), 'T' => ("KeyT", true),
+        'u' => ("KeyU", false), 'U' => ("KeyU", true),
+        'v' => ("KeyV", false), 'V' => ("KeyV", true),
+        'w' => ("KeyW", false), 'W' => ("KeyW", true),
+        'x' => ("KeyX", false), 'X' => ("KeyX", true),
+        'y' => ("KeyY", false), 'Y' => ("KeyY", true),
+        'z' => ("KeyZ", false), 'Z' => ("KeyZ", true),
+        '0' => ("Digit0", false), ')' => ("Digit0", true),
+        '1' => ("Digit1", false), '!' => ("Digit1", true),
+        '2' => ("Digit2", false), '@' => ("Digit2", true),
+        '3' => ("Digit3", false), '#' => ("Digit3", true),
+        '4' => ("Digit4", false), '$' => ("Digit4", true),
+        '5' => ("Digit5", false), '%' => ("Digit5", true),
+        '6' => ("Digit6", false), '^' => ("Digit6", true),
+        '7' => ("Digit7", false), '&' => ("Digit7", true),
+        '8' => ("Digit8", false), '*' => ("Digit8", true),
+        '9' => ("Digit9", false), '(' => ("Digit9", true),
+        '-' => ("Minus", false), '_' => ("Minus", true),
+        '=' => ("Equal", false), '+' => ("Equal", true),
+        '[' => ("BracketLeft", false), '{' => ("BracketLeft", true),
+        ']' => ("BracketRight", false), '}' => ("BracketRight", true),
+        '\\' => ("Backslash", false), '|' => ("Backslash", true),
+        ';' => ("Semicolon", false), ':' => ("Semicolon", true),
+        '\'' => ("Quote", false), '"' => ("Quote", true),
+        ',' => ("Comma", false), '<' => ("Comma", true),
+        '.' => ("Period", false), '>' => ("Period", true),
+        '/' => ("Slash", false), '?' => ("Slash", true),
+        '`' => ("Backquote", false), '~' => ("Backquote", true),
+        ' ' => ("Space", false),
+        '\t' => ("Tab", false),
+        '\n' | '\r' => ("Enter", false),
+        _ => ("", false),
+    }
 }
