@@ -171,7 +171,7 @@ impl Page {
 /// page outlives every element derived from it — a dangling handle is a compile
 /// error rather than undefined behaviour.
 pub struct Element<'p> {
-    node_id: u64,
+    pub node_id: u64,
     page: &'p Page,
 }
 
