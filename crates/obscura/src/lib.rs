@@ -25,7 +25,7 @@ pub use browser::Browser;
 pub use config::BrowserConfig;
 pub use cookie::{Cookie, CookieStore};
 pub use error::Error;
-pub use page::Page;
+pub use page::{Element, Page};
 
 // Request/response interception types (issue #306).
 pub use obscura_browser::{InterceptedRequest, InterceptResolution};
